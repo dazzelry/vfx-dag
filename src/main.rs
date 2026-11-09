@@ -1,84 +1,132 @@
-use std::collections::HashMap;
+mod graph;
+mod ffmpeg;
+mod dsl;
+mod compiler;
+use graph::{
+    Blend, BlendMode, BoxBlur, ClipSource, ColorCorrection, FrameBuffer, FrameCtx, GraphBuilder, Node,
+};
+use std::collections::{HashMap, HashSet};
 
-#[derive(Debug, Clone)]
-struct Node {
-    name: String,
-    // --- New Timeline Attributes ---
-    start_frame: u32,
-    end_frame: u32,
-    dependencies: Vec<String>,
+/// Evaluate one frame. Returns `None` if `root` is inactive (or produces nothing) at `frame_idx`.
+pub fn evaluate_frame(
+    graph: &HashMap<String, Node>,
+    frame_idx: u32,
+    root: &str,
+) -> Option<FrameBuffer> {
+    let mut cache: HashMap<String, Option<FrameBuffer>> = HashMap::new();
+    let mut visiting = HashSet::new();
+    eval_node(graph, frame_idx, root, &mut cache, &mut visiting)
+}
+
+fn eval_node(
+    graph: &HashMap<String, Node>,
+    frame_idx: u32,
+    name: &str,
+    cache: &mut HashMap<String, Option<FrameBuffer>>,
+    visiting: &mut HashSet<String>,
+) -> Option<FrameBuffer> {
+    if let Some(buf) = cache.get(name) {
+        return buf.clone();
+    }
+    if !visiting.insert(name.to_string()) {
+        panic!("cycle detected at node {name}");
+    }
+
+    let node = graph
+        .get(name)
+        .unwrap_or_else(|| panic!("unknown node '{name}'"));
+
+    // Outside the node's active range: it contributes nothing.
+    let output = if frame_idx < node.start_frame || frame_idx > node.end_frame {
+        None
+    } else {
+        let inputs: Vec<Option<FrameBuffer>> = node
+            .dependencies
+            .iter()
+            .map(|dep| eval_node(graph, frame_idx, dep, cache, visiting))
+            .collect();
+
+        let ctx = FrameCtx {
+            global: frame_idx,
+            local: frame_idx - node.start_frame,
+        };
+        node.processor.process(ctx, &inputs)
+    };
+
+    visiting.remove(name);
+    cache.insert(name.to_string(), output.clone());
+    output
 }
 
 fn main() {
-    // 1. Define our asset timeline/graph
-    let mut graph: HashMap<String, Node> = HashMap::new();
+    // 1. Load background clip
+    // 2. Color-correct it
+    // 3. Load a foreground/overlay clip (frames 30..=70 only)
+    // 4. Blur the foreground
+    // 5. Composite with Screen blend (background passes through when fg is inactive)
+    let (graph, execution_order) = GraphBuilder::new()
+        // Background: blue-ish gradient
+        .add_clip("bg_load", 0, 100, Box::new(ClipSource {
+            color: [50, 100, 200],
+            width: 640,
+            height: 480,
+        }))
+        .add_clip("bg_color", 0, 100, Box::new(ColorCorrection {
+            brightness: 30.0,
+            contrast: 1.1,
+            saturation: 1.2,
+        }))
+        .depends_on("bg_color", "bg_load")
+        // Foreground: red-ish gradient (active frames 30..=70 only)
+        .add_clip("fg_load", 30, 70, Box::new(ClipSource {
+            color: [255, 100, 50],
+            width: 640,
+            height: 480,
+        }))
+        .add_clip("fg_blur", 30, 70, Box::new(BoxBlur { radius: 3 }))
+        .depends_on("fg_blur", "fg_load")
+        // Composite: blend fg onto bg with Screen mode
+        .add_clip("composite", 0, 100, Box::new(Blend {
+            mode: BlendMode::Screen,
+            opacity: 0.8,
+        }))
+        .depends_on("composite", "bg_color")
+        .depends_on("composite", "fg_blur")
+        .build();
 
-    // Background clip runs from frame 0 to 100
-    graph.insert("Load_Background_Clip".to_string(), Node {
-        name: "Load_Background_Clip".to_string(),
-        start_frame: 0,
-        end_frame: 100,
-        dependencies: vec![],
-    });
+    println!("--- ProseCut: Effect Processor Pipeline ---");
+    println!("Execution order: {:?}", execution_order);
+    println!();
 
-    // An adjustment layer/effect clip that only appears between frames 30 and 60
-    graph.insert("Apply_Flash_Blur".to_string(), Node {
-        name: "Apply_Flash_Blur".to_string(),
-        start_frame: 30,
-        end_frame: 60,
-        dependencies: vec![], 
-    });
-
-    // The compositor layer merges everything. It depends on both clips, 
-    // but its actual lifespan matches the background.
-    graph.insert("Composite_Layers".to_string(), Node {
-        name: "Composite_Layers".to_string(),
-        start_frame: 0,
-        end_frame: 100,
-        dependencies: vec!["Load_Background_Clip".to_string(), "Apply_Flash_Blur".to_string()], 
-    });
-
-    println!("--- Initializing ProseCut Timeline & DAG Engine ---");
-    
-    // 2. Simulating a 5-frame jump sequence to test timeline boundaries
-    // Instead of looping all 100 frames, let's sample critical points:
-    let sample_frames = vec![10, 45, 80]; 
-    let execution_order = vec!["Load_Background_Clip", "Apply_Flash_Blur", "Composite_Layers"];
-
-    for current_frame in sample_frames {
-        println!("\n🎬 [RENDERING FRAME {}]", current_frame);
-
-        for task_name in &execution_order {
-            let node = &graph[*task_name];
-
-            // --- TIMELINE FILTER ---
-            // Check if this node is even alive on the current frame
-            if current_frame >= node.start_frame && current_frame <= node.end_frame {
-                println!("  ↳ Task '{}' is ACTIVE", node.name);
-                
-                // Evaluate dependencies
-                if node.dependencies.is_empty() {
-                    println!("       -> Executing baseline track.");
-                } else {
-                    // Check which dependencies are ALSO active right now
-                    let active_deps: Vec<&String> = node.dependencies
-                        .iter()
-                        .filter(|dep| {
-                            let dep_node = &graph[*dep];
-                            current_frame >= dep_node.start_frame && current_frame <= dep_node.end_frame
-                        })
-                        .collect();
-
-                    if active_deps.is_empty() {
-                        println!("       -> Dependencies configured, but none are active on this frame. Compositing baseline only.");
-                    } else {
-                        println!("       -> Wait! Evaluation includes active dependencies: {:?}", active_deps);
-                        println!("       -> Compositing layers together!");
-                    }
-                }
-            } else {
-                println!("  ↳ Task '{}' is INACTIVE (Skipping)", node.name);
-            }
+    // Spot-check frames before fg, during fg, and after fg.
+    for frame_idx in [15, 50, 85] {
+        println!("Frame {}", frame_idx);
+        match evaluate_frame(&graph, frame_idx, "composite") {
+            None => println!("  (inactive range)"),
+            Some(out) => println!(
+                "  Output: {}x{}, {} pixels",
+                out.width,
+                out.height,
+                out.pixels.len()
+            ),
         }
     }
+
+    // Render the full range to PNGs.
+    // Assemble with: ffmpeg -framerate 24 -start_number 0 -i out/frame_%04d.png -pix_fmt yuv420p out.mp4
+    println!();
+    println!("Rendering frames 0..=100 to out/ ...");
+    for frame_idx in 0..=100u32 {
+        match evaluate_frame(&graph, frame_idx, "composite") {
+            Some(out) => {
+                let path = format!("out/frame_{:04}.png", frame_idx);
+                if let Err(e) = out.save_png(&path) {
+                    eprintln!("failed to write {path}: {e}");
+                    return;
+                }
+            }
+            None => eprintln!("frame {frame_idx}: composite inactive, skipped"),
+        }
+    }
+    println!("Done.");
 }

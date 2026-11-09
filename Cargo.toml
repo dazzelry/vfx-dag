@@ -1,6 +1,12 @@
 [package]
-name = "Syslab"
+name = "vfx-dag"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
+# 0.24 keeps `image::io::Reader` valid; on 0.25+ it's deprecated in favor of `image::ImageReader`.
+image = "0.25"
+
+# Debug builds are very slow for per-pixel loops; this makes `cargo run` usable.
+[profile.dev]
+opt-level = 3
